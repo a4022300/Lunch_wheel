@@ -107,12 +107,19 @@
             <div class="relative w-64 h-64">
                 <!-- 轉盤指標 -->
                 <div class="absolute -top-2 left-1/2 -translate-x-1/2 w-0 h-0 border-l-[12px] border-l-transparent border-r-[12px] border-r-transparent border-t-[20px] border-t-red-500 z-10"></div>
-                <!-- 轉盤 Canvas (動畫時間修改為 500ms) -->
+                <!-- 轉盤 Canvas -->
+                <!-- 【優化：轉盤動畫時間縮短至 500ms】 -->
                 <canvas id="wheel-canvas" width="256" height="256" class="rounded-full shadow-lg transition-transform duration-[500ms] ease-out"></canvas>
             </div>
-            <button id="btn-spin" class="px-6 py-2 bg-yellow-400 hover:bg-yellow-500 text-gray-900 font-bold rounded-full shadow-md transition">
-                🎉 開始轉盤！
-            </button>
+            <div class="flex gap-2">
+                <button id="btn-spin" class="px-6 py-2 bg-yellow-400 hover:bg-yellow-500 text-gray-900 font-bold rounded-full shadow-md transition">
+                    🎉 開始轉盤！
+                </button>
+                <button id="btn-reset-pool" class="hidden px-4 py-2 bg-gray-200 hover:bg-gray-300 text-gray-700 font-medium rounded-full text-sm transition">
+                    重置名單
+                </button>
+            </div>
+            <p id="pool-count-text" class="text-xs text-gray-400"></p>
         </div>
 
         <!-- 結果展示與地圖按鈕 -->
@@ -129,7 +136,8 @@
     <script>
         let lat = null;
         let lng = null;
-        let restaurantList = []; // 目前仍在轉盤上的餐廳名單
+        let restaurantList = []; // 原始搜尋到的總候選清單 (最多20家)
+        let activePool = [];     // 目前尚未被抽中的轉盤獎池清單
         let isSpinning = false;
 
         const locInput = document.getElementById('location-input');
@@ -144,6 +152,8 @@
         const wheelSection = document.getElementById('wheel-section');
         const wheelCanvas = document.getElementById('wheel-canvas');
         const btnSpin = document.getElementById('btn-spin');
+        const btnResetPool = document.getElementById('btn-reset-pool');
+        const poolCountText = document.getElementById('pool-count-text');
         const resultSection = document.getElementById('result-section');
         const resultName = document.getElementById('result-name');
         const resultDetail = document.getElementById('result-detail');
@@ -154,11 +164,7 @@
             let minVal = parseInt(sliderMin.value);
             let maxVal = parseInt(sliderMax.value);
             if (minVal > maxVal) {
-                let temp = minVal;
-                minVal = maxVal;
-                sliderMin.value = maxVal;
-                maxVal = temp;
-                sliderMax.value = temp;
+                let temp = minVal; minVal = maxVal; sliderMin.value = maxVal; maxVal = temp; sliderMax.value = temp;
             }
             const minPercent = ((minVal - 50) / 950) * 100;
             const maxPercent = ((maxVal - 50) / 950) * 100;
@@ -179,8 +185,7 @@
             btnLocate.textContent = '定位中...';
             navigator.geolocation.getCurrentPosition(
                 (position) => {
-                    lat = position.coords.latitude;
-                    lng = position.coords.longitude;
+                    lat = position.coords.latitude; lng = position.coords.longitude;
                     locInput.value = `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
                     btnLocate.textContent = '重新定位';
                 },
@@ -204,16 +209,15 @@
             wheelSection.classList.add('hidden');
             resultSection.classList.add('hidden');
 
-            const radius = 1000; 
+            const radius = 1000;
             
-            // 【優化：排除已歇業】直接加入語法排除已被地圖標註為 destroyed, abandoned, disused 或明確寫著 closed 的商家
+            // 【優化：從源頭過濾已歇業、停業的地理節點】
             const query = `
                 [out:json][timeout:15];
                 (
-                  node["amenity"="restaurant"]["name"](around:${radius},${lat},${lng});
-                  node["amenity"="fast_food"]["name"](around:${radius},${lat},${lng});
+                  node["amenity"="restaurant"]["name"]["abandoned"!~".*"]["closed"!~".*"]["status"!~"closed"](around:${radius},${lat},${lng});
+                  node["amenity"="fast_food"]["name"]["abandoned"!~".*"]["closed"!~".*"]["status"!~"closed"](around:${radius},${lat},${lng});
                 );
-                node._["destroyed"!~".*"]["abandoned"!~".*"]["disused"!~".*"]["closed"!~".*"]["status"!~"closed|closed_down"];
                 out body;
             `;
 
@@ -222,10 +226,11 @@
                 if (!response.ok) throw new Error('API 請求失敗');
                 const data = await response.json();
                 
+                // 黑名單關鍵字與歇業關鍵字過濾
                 const blacklistedKeywords = [
                     '7-11', '7-eleven', '全家', 'family_mart', 'familymart', '萊爾富', 'ok超商', 'ok mart', 
                     '星巴克', 'starbucks', '路易莎', 'louisa', 'cama', '美廉社', '蝦皮', '餐廳', '小吃部', 
-                    '攤販', '自動販賣機', '販賣機', '得來速'
+                    '攤販', '自動販賣機', '販賣機', '得來速', '已歇業', '已停業', '搬遷', '舊址'
                 ];
 
                 let rawRestaurants = data.elements
@@ -234,21 +239,26 @@
                         lat: el.lat,
                         lng: el.lon,
                         cuisine: (el.tags.cuisine || '').toLowerCase(),
-                        // 雙重保險防歇業：如果名字裡有寫(已歇業)或(已搬遷)也拿掉
-                        isClosed: el.tags.note && el.tags.note.includes('歇業') || (el.tags.name || '').includes('已歇業')
+                        description: (el.tags.description || '').toLowerCase()
                     }))
                     .filter(r => {
-                        if (!r.name || r.name.length <= 1 || r.isClosed) return false;
+                        if (!r.name || r.name.length <= 1) return false;
+                        
                         const lowerName = r.name.toLowerCase();
-                        return !blacklistedKeywords.some(kw => lowerName.includes(kw));
+                        const lowerDesc = r.description;
+                        
+                        // 檢查名稱或註解中是否含有歇業或黑名單關鍵字
+                        const isInvalid = blacklistedKeywords.some(kw => lowerName.includes(kw) || lowerDesc.includes(kw));
+                        return !isInvalid;
                     });
 
-                // 嚴格去重（名字去重 & 距離去重）
+                // 嚴格去重
                 let uniqueRestaurants = [];
                 let seenNames = new Set();
 
                 for (let r of rawRestaurants) {
                     if (seenNames.has(r.name)) continue;
+
                     let isDuplicateLocation = uniqueRestaurants.some(existing => {
                         const dist = getDistance(r.lat, r.lng, existing.lat, existing.lng);
                         const isSimilarName = r.name.includes(existing.name) || existing.name.includes(r.name);
@@ -261,24 +271,25 @@
                     }
                 }
 
-                // 根據類型過濾
+                // 種類過濾
                 const selectedCuisine = cuisineSelect.value;
                 let filteredList = filterByCuisine(uniqueRestaurants, selectedCuisine);
 
-                // 隨機篩選出最多 8 間作為本次「初始候選清單」
-                if (filteredList.length > 8) {
-                    restaurantList = filteredList.sort(() => 0.5 - Math.random()).slice(0, 8);
-                } else {
-                    restaurantList = filteredList;
+                // 【優化：調整上限為最多 20 家餐廳】
+                if (filteredList.length > 20) {
+                    filteredList = filteredList.sort(() => 0.5 - Math.random()).slice(0, 20);
                 }
 
-                if (restaurantList.length === 0) {
+                if (filteredList.length === 0) {
                     statusText.textContent = '❌ 附近找不到符合您選擇類型的精確餐廳名稱，請換個類型再試試！';
                     return;
                 }
 
-                statusText.textContent = `🎉 已為您準備了 ${restaurantList.length} 家精選餐廳！`;
-                drawWheel(restaurantList);
+                // 初始化名單與抽獎池
+                restaurantList = [...filteredList];
+                resetPrizePool();
+
+                statusText.textContent = `🎉 已為您準備了 ${restaurantList.length} 家精選餐廳放入轉盤！`;
                 wheelSection.classList.remove('hidden');
 
             } catch (error) {
@@ -287,17 +298,35 @@
             }
         });
 
+        // 重置抽獎池
+        function resetPrizePool() {
+            activePool = [...restaurantList];
+            btnResetPool.classList.add('hidden');
+            updatePoolStatus();
+            drawWheel(activePool);
+        }
+
+        // 更新剩下幾家店的文字提示
+        function updatePoolStatus() {
+            poolCountText.textContent = `目前轉盤剩餘項目：${activePool.length} / ${restaurantList.length} 家`;
+        }
+
+        btnResetPool.addEventListener('click', () => {
+            resetPrizePool();
+            resultSection.classList.add('hidden');
+        });
+
+        // 兩點經緯度距離計算 (公尺)
         function getDistance(lat1, lon1, lat2, lon2) {
             const R = 6371000;
             const dLat = (lat2 - lat1) * Math.PI / 180;
             const dLon = (lon2 - lon1) * Math.PI / 180;
             const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
-                      Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * 
-                      Math.sin(dLon/2) * Math.sin(dLon/2);
-            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-            return R * c;
+                      Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon/2) * Math.sin(dLon/2);
+            return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
         }
 
+        // 料理篩選
         function filterByCuisine(list, type) {
             if (type === 'all') return list;
             const keywordMap = {
@@ -310,62 +339,49 @@
                 american: ['american', 'burger', 'fast_food', 'steak', '美式', '漢堡', '牛排', '炸雞'],
                 other: []
             };
-
             const keywords = keywordMap[type];
             if (type === 'other') {
                 const allDefinedKeywords = Object.values(keywordMap).flat();
-                return list.filter(r => {
-                    const name = r.name.toLowerCase();
-                    const cuisine = r.cuisine;
-                    return !allDefinedKeywords.some(kw => name.includes(kw) || cuisine.includes(kw));
-                });
+                return list.filter(r => !allDefinedKeywords.some(kw => r.name.toLowerCase().includes(kw) || r.cuisine.includes(kw)));
             }
-            return list.filter(r => {
-                const name = r.name.toLowerCase();
-                const cuisine = r.cuisine;
-                return keywords.some(kw => name.includes(kw) || cuisine.includes(kw));
-            });
+            return list.filter(r => keywords.some(kw => r.name.toLowerCase().includes(kw) || r.cuisine.includes(kw)));
         }
 
-        // 3. 轉盤繪製
+        // 3. 轉盤動態繪製 (支援 1~20 家店)
         const ctx = wheelCanvas.getContext('2d');
-        const colors = ['#FFD2D2', '#FFE4CA', '#FFF9A6', '#D2FFD2', '#D2E9FF', '#E8D2FF', '#FAD2FF', '#E0E0E0'];
+        const colorPalette = ['#FFD2D2', '#FFE4CA', '#FFF9A6', '#D2FFD2', '#D2E9FF', '#E8D2FF', '#FAD2FF', '#E0E0E0'];
 
         function drawWheel(items) {
-            const numSegments = items.length;
             ctx.clearRect(0, 0, wheelCanvas.width, wheelCanvas.height);
+            const numSegments = items.length;
 
-            // 如果轉盤空了，提示使用者重新搜尋
             if (numSegments === 0) {
-                ctx.fillStyle = '#374151';
-                ctx.font = 'bold 14px sans-serif';
-                ctx.textAlign = 'center';
-                ctx.fillText('餐廳已全數轉完！', 128, 128);
-                ctx.fillText('請重新點擊上方搜尋。', 128, 148);
+                // 如果空了，繪製一個灰色空圓形
+                ctx.fillStyle = '#f3f4f6';
+                ctx.beginPath(); ctx.arc(128, 128, 128, 0, 2 * Math.PI); ctx.fill();
+                ctx.fillStyle = '#9ca3af'; ctx.font = 'bold 14px sans-serif'; ctx.textAlign = 'center';
+                ctx.fillText('名單已全部抽完！', 128, 132);
                 return;
             }
 
             const arcSize = (2 * Math.PI) / numSegments;
-            ctx.textAlign = 'left';
-
             for (let i = 0; i < numSegments; i++) {
                 const angle = i * arcSize;
-                ctx.fillStyle = colors[i % colors.length];
-                ctx.beginPath();
-                ctx.moveTo(128, 128);
-                ctx.arc(128, 128, 128, angle, angle + arcSize);
-                ctx.lineTo(128, 128);
-                ctx.fill();
+                ctx.fillStyle = colorPalette[i % colorPalette.length];
+                ctx.beginPath(); ctx.moveTo(128, 128); ctx.arc(128, 128, 128, angle, angle + arcSize); ctx.lineTo(128, 128); ctx.fill();
 
                 ctx.save();
                 ctx.fillStyle = '#374151';
-                ctx.font = 'bold 11px sans-serif';
+                // 當項目變多 (例如20個)，字體自動縮小防重疊
+                const fontSize = numSegments > 12 ? '9px' : '11px';
+                ctx.font = `bold ${fontSize} sans-serif`;
                 ctx.translate(128, 128);
                 ctx.rotate(angle + arcSize / 2);
                 
                 let displayName = items[i].name;
-                if (displayName.length > 6) {
-                    displayName = displayName.substring(0, 5) + '...';
+                const maxLen = numSegments > 12 ? 4 : 6; 
+                if (displayName.length > maxLen) {
+                    displayName = displayName.substring(0, maxLen - 1) + '..';
                 }
                 
                 ctx.fillText(displayName, 45, 4);
@@ -373,56 +389,56 @@
             }
         }
 
-        // 4. 高速旋轉與結果去重移除邏輯
+        // 4. 旋轉動畫控制 (改為 500ms 快速完成)
         btnSpin.addEventListener('click', () => {
             if (isSpinning) return;
-            
-            // 防呆：如果轉盤上的店已經被剔除光了
-            if (restaurantList.length === 0) {
-                alert('這批候選餐廳已經全部轉完囉！請重新點擊上方的「尋找方圓 1 公里餐廳」按鈕獲取新清單。');
+            if (activePool.length === 0) {
+                alert('所有餐廳都已經抽過一遍囉！請點選「重置名單」重新開始。');
                 return;
             }
-
+            
             isSpinning = true;
             resultSection.classList.add('hidden');
 
-            // 產生隨機旋轉角度
-            const degrees = 360 * 5 + Math.floor(Math.random() * 360); 
+            const degrees = 360 * 4 + Math.floor(Math.random() * 360); 
             wheelCanvas.style.transform = `rotate(${degrees}deg)`;
 
-            // 500ms (0.5秒) 後急停並揭曉結果
+            // 【優化：500毫秒後立刻觸發結果】
             setTimeout(() => {
                 isSpinning = false;
                 const actualDegree = degrees % 360;
-                const numSegments = restaurantList.length;
+                const numSegments = activePool.length;
                 const arcSizeDeg = 360 / numSegments;
                 
-                // 計算被指針選中的餐廳索引
                 const index = Math.floor(((360 - actualDegree + 270) % 360) / arcSizeDeg);
-                const winner = restaurantList[index];
+                const winner = activePool[index];
 
-                // 顯示本次中獎結果
+                // 顯示結果
                 resultName.textContent = winner.name;
-                resultDetail.textContent = `這家店已從後續的轉盤中移除。不滿意可以再按一次轉盤！`;
+                resultDetail.textContent = `這家店已從轉盤中移除，下次點擊不會重複出現。`;
                 btnGoogleMap.href = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(winner.name)}&query_place_id=&query=${winner.lat},${winner.lng}`;
                 resultSection.classList.remove('hidden');
-
-                // 【關鍵更新：去重機制】將轉出的這家餐廳從目前的陣列中移除
-                restaurantList.splice(index, 1);
                 
-                // 提示剩餘幾家店
-                statusText.textContent = `💡 轉盤剩下 ${restaurantList.length} 家精選餐廳可供抉擇。`;
+                // 【優化：不重複機制 — 將抽中的元素從獎池中移除】
+                activePool.splice(index, 1);
+                updatePoolStatus();
+                
+                // 顯示重置按鈕讓使用者可以隨時手動復原
+                if (activePool.length < restaurantList.length) {
+                    btnResetPool.classList.remove('hidden');
+                }
 
-                // 立即重新繪製去除中獎店面後的轉盤，且瞬間把角度重設，維持下一次點擊的動畫流暢度
+                // 重置轉盤 DOM 的動畫屬性並重新繪製剩下項目的新轉盤
                 wheelCanvas.style.transition = 'none';
                 wheelCanvas.style.transform = `rotate(${actualDegree}deg)`;
-                drawWheel(restaurantList);
                 
+                // 稍微延遲讓 Canvas 重新渲染剩餘項目的新畫面
                 setTimeout(() => {
+                    drawWheel(activePool);
                     wheelCanvas.style.transition = 'transform 500ms ease-out';
                 }, 50);
 
-            }, 500); // 核心動畫時間設定為 500 毫秒
+            }, 500);
         });
     </script>
 </body>
