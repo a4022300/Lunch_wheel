@@ -4,10 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>午餐吃什麼？</title>
-    <!-- Tailwind CSS 引入 -->
+    <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        /* 雙滑桿樣式優化 */
         .slider-container {
             position: relative;
             width: 100%;
@@ -128,13 +127,11 @@
     </div>
 
     <script>
-        // --- 狀態變數 ---
         let lat = null;
         let lng = null;
         let restaurantList = [];
         let isSpinning = false;
 
-        // --- DOM 節點 ---
         const locInput = document.getElementById('location-input');
         const btnLocate = document.getElementById('btn-locate');
         const cuisineSelect = document.getElementById('cuisine-select');
@@ -152,11 +149,10 @@
         const resultDetail = document.getElementById('result-detail');
         const btnGoogleMap = document.getElementById('btn-google-map');
 
-        // --- 雙滑桿邏輯 ---
+        // 雙滑桿邏輯
         function updateSlider() {
             let minVal = parseInt(sliderMin.value);
             let maxVal = parseInt(sliderMax.value);
-
             if (minVal > maxVal) {
                 let temp = minVal;
                 minVal = maxVal;
@@ -164,10 +160,8 @@
                 maxVal = temp;
                 sliderMax.value = temp;
             }
-
             const minPercent = ((minVal - 50) / 950) * 100;
             const maxPercent = ((maxVal - 50) / 950) * 100;
-
             sliderRange.style.left = minPercent + '%';
             sliderRange.style.right = (100 - maxPercent) + '%';
             budgetValue.textContent = `$${minVal} - $${maxVal === 1000 ? '1000+' : maxVal}`;
@@ -176,7 +170,7 @@
         sliderMax.addEventListener('input', updateSlider);
         updateSlider();
 
-        // --- 1. 自動定位功能 ---
+        // 1. 自動定位
         btnLocate.addEventListener('click', () => {
             if (!navigator.geolocation) {
                 alert('您的瀏覽器不支援定位功能。');
@@ -198,7 +192,7 @@
             );
         });
 
-        // --- 2. 餐廳搜尋邏輯 (Overpass API) ---
+        // 2. 餐廳搜尋與嚴格清洗邏輯 (排除歇業、去重、去非店名)
         btnSearch.addEventListener('click', async () => {
             if (!lat || !lng) {
                 alert('請先點擊「自動定位」按鈕獲取您的位置！');
@@ -206,22 +200,21 @@
             }
 
             statusText.classList.remove('hidden');
-            statusText.textContent = '🔍 正在搜尋附近美食...';
+            statusText.textContent = '🔍 正在搜尋附近美食並過濾歇業店家...';
             wheelSection.classList.add('hidden');
             resultSection.classList.add('hidden');
 
-            const radius = 1000; // 方圓一公里
+            const radius = 1000; 
             
-            // 構建 Overpass QL 查詢 (搜尋半徑 1000 公尺內的餐廳與快速道路、小吃)
+            // 【優化 1：API 端直接排除已標記歇業、荒廢或停業的節點】
+            // [!closed][!historic] 以及排除含有 "abandoned" 標籤的節點
             const query = `
-                [out:json][timeout:25];
+                [out:json][timeout:15];
                 (
-                  node["amenity"="restaurant"](around:${radius},${lat},${lng});
-                  way["amenity"="restaurant"](around:${radius},${lat},${lng});
-                  node["amenity"="fast_food"](around:${radius},${lat},${lng});
-                  way["amenity"="fast_food"](around:${radius},${lat},${lng});
+                  node["amenity"="restaurant"]["name"]["abandoned:amenity"!~"."]["closed"!~"yes"]["historic"!~"."](around:${radius},${lat},${lng});
+                  node["amenity"="fast_food"]["name"]["abandoned:amenity"!~"."]["closed"!~"yes"]["historic"!~"."](around:${radius},${lat},${lng});
                 );
-                out center;
+                out body;
             `;
 
             try {
@@ -229,75 +222,125 @@
                 if (!response.ok) throw new Error('API 請求失敗');
                 const data = await response.json();
                 
-                let rawRestaurants = data.elements.map(el => {
-                    return {
-                        name: el.tags.name || '未命名餐廳',
-                        lat: el.lat || el.center.lat,
-                        lng: el.lon || el.center.lon,
-                        cuisine: el.tags.cuisine || 'other',
-                        price: el.tags.price_level || null
-                    };
-                }).filter(r => r.name !== '未命名餐廳');
+                // 【優化 2：前端篩選黑名單 & 歇業關鍵字】
+                const filterKeywords = [
+                    // 便利商店與特定非正餐連鎖
+                    '7-11', '7-eleven', '全家', 'family_mart', 'familymart', '萊爾富', 'ok超商', 'ok mart', 
+                    '星巴克', 'starbucks', '路易莎', 'louisa', 'cama', '美廉社', '蝦皮', '餐廳', '小吃部', 
+                    '攤販', '自動販賣機', '販賣機', '得來速',
+                    // 歇業與異常標籤關鍵字
+                    '已歇業', '已停業', '歇業', '停業', '已關閉', '永久停業', '搬遷', 'closed', 'permanently closed'
+                ];
 
-                // 根據使用者選的「料理類型」做前端篩選
+                let rawRestaurants = data.elements
+                    .map(el => ({
+                        name: (el.tags.name || '').trim(),
+                        lat: el.lat,
+                        lng: el.lon,
+                        cuisine: (el.tags.cuisine || '').toLowerCase(),
+                        // 有些網友會把歇業資訊寫在備註（description/note）裡，我們一併抓取來做雙重過濾
+                        note: ((el.tags.note || '') + ' ' + (el.tags.description || '')).toLowerCase()
+                    }))
+                    .filter(r => {
+                        if (!r.name || r.name.length <= 1) return false;
+                        
+                        const lowerName = r.name.toLowerCase();
+                        const lowerNote = r.note;
+                        
+                        // 1. 如果店名或備註中包含「已歇業/停業」或「便利超商」等關鍵字，直接排除
+                        const isInvalid = filterKeywords.some(kw => lowerName.includes(kw) || lowerNote.includes(kw));
+                        if (isInvalid) return false;
+
+                        return true;
+                    });
+
+                // 【優化 3：地理與名稱去重】
+                let uniqueRestaurants = [];
+                let seenNames = new Set();
+
+                for (let r of rawRestaurants) {
+                    if (seenNames.has(r.name)) continue;
+
+                    let isDuplicateLocation = uniqueRestaurants.some(existing => {
+                        const dist = getDistance(r.lat, r.lng, existing.lat, existing.lng);
+                        const isSimilarName = r.name.includes(existing.name) || existing.name.includes(r.name);
+                        return dist < 25 && isSimilarName; 
+                    });
+
+                    if (!isDuplicateLocation) {
+                        uniqueRestaurants.push(r);
+                        seenNames.add(r.name);
+                    }
+                }
+
+                // 根據料理類型過濾
                 const selectedCuisine = cuisineSelect.value;
-                restaurantList = filterByCuisine(rawRestaurants, selectedCuisine);
+                restaurantList = filterByCuisine(uniqueRestaurants, selectedCuisine);
 
-                // 隨機取最多 8 間，維持轉盤的美觀性與易讀性
                 if (restaurantList.length > 8) {
                     restaurantList = restaurantList.sort(() => 0.5 - Math.random()).slice(0, 8);
                 }
 
                 if (restaurantList.length === 0) {
-                    statusText.textContent = '❌ 方圓一公里內找不到符合此類型的餐廳，請更換類型再試試！';
+                    statusText.textContent = '❌ 附近找不到符合您選擇類型且營業中的餐廳，請換個類型再試試！';
                     return;
                 }
 
-                statusText.textContent = `🎉 成功找到 ${restaurantList.length} 間附近餐廳！`;
+                statusText.textContent = `🎉 已排除歇業店家，並為您挑選了 ${restaurantList.length} 家營業中餐廳！`;
                 drawWheel(restaurantList);
                 wheelSection.classList.remove('hidden');
 
             } catch (error) {
                 console.error(error);
-                statusText.textContent = '❌ 搜尋時發生錯誤，請稍後再試。';
+                statusText.textContent = '❌ 搜尋時發生錯誤或連線逾時，請稍後再試。';
             }
         });
 
-        // 簡單的料理關鍵字分類器 (因為 OpenStreetMap 資料通常是英文標籤)
+        // 兩點經緯度距離計算（公尺）
+        function getDistance(lat1, lon1, lat2, lon2) {
+            const R = 6371000;
+            const dLat = (lat2 - lat1) * Math.PI / 180;
+            const dLon = (lon2 - lon1) * Math.PI / 180;
+            const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+                      Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * 
+                      Math.sin(dLon/2) * Math.sin(dLon/2);
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+            return R * c;
+        }
+
+        // 料理篩選邏輯
         function filterByCuisine(list, type) {
             if (type === 'all') return list;
-            
             const keywordMap = {
-                taiwanese: ['taiwanese', 'taiwan', 'traditional', 'chinese', 'noodle', 'dumpling', 'beef_noodle', '台灣', '台式', '小吃', '便當'],
-                japanese: ['japanese', 'sushi', 'ramen', 'donburi', 'bento', '日式', '日本', '拉麵', '壽司', '丼飯'],
-                korean: ['korean', 'bbq', '韓式', '韓國', '烤肉', '泡菜'],
-                thai: ['thai', '泰式', '泰國'],
-                cantonese: ['cantonese', 'dim_sum', '港式', '粵式', '燒臘', '飲茶'],
-                vietnamese: ['vietnamese', 'pho', '越式', '越南'],
-                american: ['american', 'burger', 'fast_food', 'steak', '美式', '漢堡', '牛排'],
+                taiwanese: ['taiwanese', 'taiwan', 'traditional', 'chinese', 'noodle', 'dumpling', 'beef_noodle', '台灣', '台式', '小吃', '便當', '肉圓', '滷肉飯', '麵攤', '鵝肉', '鴨肉', '雞肉飯'],
+                japanese: ['japanese', 'sushi', 'ramen', 'donburi', 'bento', '日式', '日本', '拉麵', '壽司', '丼飯', '居酒屋', '定食', '烏龍麵', '生魚片'],
+                korean: ['korean', 'bbq', '韓式', '韓國', '烤肉', '泡菜', '豆腐鍋', '部隊鍋', '炸雞'],
+                thai: ['thai', '泰式', '泰國', '椒麻雞', '打拋豬'],
+                cantonese: ['cantonese', 'dim_sum', '港式', '粵式', '燒臘', '飲茶', '茶餐廳', '粥'],
+                vietnamese: ['vietnamese', 'pho', '越式', '越南', '河粉', '春捲'],
+                american: ['american', 'burger', 'fast_food', 'steak', '美式', '漢堡', '牛排', '沙拉'],
                 other: []
             };
 
             const keywords = keywordMap[type];
 
             if (type === 'other') {
-                // 回傳不屬於以上任何一種類型的餐廳
                 const allDefinedKeywords = Object.values(keywordMap).flat();
                 return list.filter(r => {
                     const name = r.name.toLowerCase();
-                    const cuisine = (r.cuisine || '').toLowerCase();
+                    const cuisine = r.cuisine;
                     return !allDefinedKeywords.some(kw => name.includes(kw) || cuisine.includes(kw));
                 });
             }
 
             return list.filter(r => {
                 const name = r.name.toLowerCase();
-                const cuisine = (r.cuisine || '').toLowerCase();
+                const cuisine = r.cuisine;
                 return keywords.some(kw => name.includes(kw) || cuisine.includes(kw));
             });
         }
 
-        // --- 3. 轉盤繪製與控制 ---
+        // 3. 轉盤繪製
         const ctx = wheelCanvas.getContext('2d');
         const colors = ['#FFD2D2', '#FFE4CA', '#FFF9A6', '#D2FFD2', '#D2E9FF', '#E8D2FF', '#FAD2FF', '#E0E0E0'];
 
@@ -315,45 +358,47 @@
                 ctx.lineTo(128, 128);
                 ctx.fill();
 
-                // 繪製文字
                 ctx.save();
                 ctx.fillStyle = '#374151';
-                ctx.font = 'bold 12px sans-serif';
+                ctx.font = 'bold 11px sans-serif';
                 ctx.translate(128, 128);
                 ctx.rotate(angle + arcSize / 2);
-                const text = items[i].name.substring(0, 8); // 太長截斷
-                ctx.fillText(text, 50, 5);
+                
+                let displayName = items[i].name;
+                if (displayName.length > 6) {
+                    displayName = displayName.substring(0, 5) + '...';
+                }
+                
+                ctx.fillText(displayName, 45, 4);
                 ctx.restore();
             }
         }
 
+        // 4. 旋轉動畫控制
         btnSpin.addEventListener('click', () => {
             if (isSpinning || restaurantList.length === 0) return;
             isSpinning = true;
             resultSection.classList.add('hidden');
 
-            const degrees = 360 * 5 + Math.floor(Math.random() * 360); // 旋轉 5 圈以上加上隨機角度
+            const degrees = 360 * 5 + Math.floor(Math.random() * 360); 
             wheelCanvas.style.transform = `rotate(${degrees}deg)`;
 
             setTimeout(() => {
                 isSpinning = false;
-                
-                // 計算轉盤停下後，指向指針（最上方 270 度 / -90 度位置）的項目
                 const actualDegree = degrees % 360;
                 const numSegments = restaurantList.length;
                 const arcSizeDeg = 360 / numSegments;
                 
-                // 轉盤逆時針偏移計算
                 const index = Math.floor(((360 - actualDegree + 270) % 360) / arcSizeDeg);
                 const winner = restaurantList[index];
 
-                // 顯示結果與導航按鈕
                 resultName.textContent = winner.name;
-                resultDetail.textContent = `位於您的座標附近，走路大約 5~10 分鐘`;
+                resultDetail.textContent = `這是一家符合您條件的附近好去處！`;
+                
                 btnGoogleMap.href = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(winner.name)}&query_place_id=&query=${winner.lat},${winner.lng}`;
                 
                 resultSection.classList.remove('hidden');
-                // 重置轉盤動畫，以便下一次旋轉
+                
                 wheelCanvas.style.transition = 'none';
                 wheelCanvas.style.transform = `rotate(${actualDegree}deg)`;
                 setTimeout(() => {
